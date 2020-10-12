@@ -1,0 +1,146 @@
+---
+- hosts: "{{ vms }}"
+  serial: 1
+  become: true
+  gather_facts: false
+  vars:
+    new_volume_size: 100
+    new_block_device: /dev/xvdm
+    new_mount_path: /mnt
+  tasks:
+    - name: Gather facts about the host
+      setup:
+        filter: ansible_mounts
+
+    - name: Save public DNS name
+      set_fact:
+        old_public_dns: "{{ ec2_public_dns_name }}"
+
+    - name: Save old volume information
+      set_fact: old_volume_info="{{ item }}"
+      loop: "{{ lookup('dict', ec2_block_devices) }}"
+      when: "'sda1' not in item.key and 'xvdm' not in item.key"
+      delegate_to: 127.0.0.1
+
+    - name: Tag old volume
+      ec2_tag:
+        region: "{{ ec2_region }}"
+        resource: "{{ old_volume_info.value }}"
+        state: present
+        tags:
+          Name: "{{ ec2_tag_Name }}"
+          Type: "{{ ec2_tag_Type }}"
+          ClusterID: "{{ ec2_tag_ClusterID }}"
+          Status: original
+      delegate_to: 127.0.0.1
+
+    - name: Create and attach new volume
+      ec2_vol:
+        instance: "{{ ec2_id }}"
+        volume_size: "{{ new_volume_size }}"
+        device_name: "{{ new_block_device }}"
+        volume_type: gp2
+        region: "{{ ec2_region }}"
+        encrypted: yes
+        delete_on_termination: yes
+        tags:
+          Name: "{{ ec2_tag_Name }}"
+          Type: "{{ ec2_tag_Type }}"
+          ClusterID: "{{ ec2_tag_ClusterID }}"
+          Status: shrinked
+      register: ec2_new_volume
+      delegate_to: 127.0.0.1
+
+    - name: Install pip
+      yum:
+        name: python-pip
+        update_cache: yes
+
+    - name: Install pip docker
+      pip:
+        name: docker
+
+    - name: Create filesystem
+      filesystem:
+        fstype: ext4
+        dev: "{{ new_block_device }}"
+        resizefs: yes
+
+    - name: Mount device
+      mount:
+        path: "{{ new_mount_path }}"
+        src: "{{ new_block_device }}"
+        fstype: ext4
+        fstab: /tmp/fstab
+        state: mounted
+
+    - name: Sync /data with new disk
+      synchronize:
+        src: /data/
+        dest: "{{ new_mount_path }}"
+      delegate_to: "{{ ec2_ip_address }}"
+
+    - name: Stop data node
+      ec2:
+        instance_ids: "{{ ec2_id }}"
+        region: "{{ ec2_region }}"
+        state: stopped
+      delegate_to: 127.0.0.1
+
+    - name: Detach old volume
+      ec2_vol:
+        id: "{{ old_volume_info.value }}"
+        region: "{{ ec2_region }}"
+        instance: None
+      delegate_to: 127.0.0.1
+
+    - name: Detach new volume
+      ec2_vol:
+        id: "{{ ec2_new_volume.volume_id }}"
+        region: "{{ ec2_region }}"
+        instance: None
+      delegate_to: 127.0.0.1
+
+    - name: Wait for 10 seconds
+      wait_for:
+        timeout: 10
+      delegate_to: 127.0.0.1
+
+    - name: Attach new volume to correct block device
+      ec2_vol:
+        instance: "{{ ec2_id }}"
+        id: "{{ ec2_new_volume.volume_id }}"
+        device_name: "/dev/{{ old_volume_info.key }}"
+        region: "{{ ec2_region }}"
+      delegate_to: 127.0.0.1
+
+    - name: Start data node
+      block:
+        - name: First attempt
+          ec2:
+            instance_ids: "{{ ec2_id }}"
+            region: "{{ ec2_region }}"
+            state: running
+            wait: yes
+            wait_timeout: 120
+          delegate_to: 127.0.0.1
+      rescue:
+        - name: Second attempt
+          ec2:
+            instance_ids: "{{ ec2_id }}"
+            region: "{{ ec2_region }}"
+            state: running
+            wait: yes
+            wait_timeout: 120
+          delegate_to: 127.0.0.1
+
+    - name: Get new ec2 public IP
+      ec2_instance_info:
+        instance_ids:
+          - "{{ ec2_id }}"
+        region: "{{ ec2_region }}"
+      register: ec2_new_info
+      delegate_to: 127.0.0.1
+
+    - debug:
+        msg: Disk resize complete for {{ old_public_dns }}, new public DNS is {{ ec2_new_info.instances[0].public_ip_address }}
